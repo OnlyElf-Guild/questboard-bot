@@ -176,10 +176,12 @@ function buildBoardText(open, claimed, confirm) {
   return text;
 }
 
-function buildQuestModal() {
+function buildQuestModal(type = "NORMAL") {
+  const isGuildQuest = type === "GUILD";
+
   const modal = new ModalBuilder()
-    .setCustomId("modal_create_quest")
-    .setTitle("Gesuch aushaengen");
+    .setCustomId(isGuildQuest ? "modal_create_guild_quest" : "modal_create_private_quest")
+    .setTitle(isGuildQuest ? "Gildengesuch aushaengen" : "Privates Gesuch aushaengen");
 
   const titleInput = new TextInputBuilder()
     .setCustomId("title")
@@ -205,14 +207,6 @@ function buildQuestModal() {
     .setMaxLength(100)
     .setPlaceholder("z. B. 300 Gold");
 
-  const typeInput = new TextInputBuilder()
-    .setCustomId("quest_type")
-    .setLabel("Typ: privat oder gilde")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true)
-    .setMaxLength(10)
-    .setPlaceholder("privat");
-
   const noteInput = new TextInputBuilder()
     .setCustomId("note")
     .setLabel("Notiz")
@@ -225,7 +219,6 @@ function buildQuestModal() {
     new ActionRowBuilder().addComponents(titleInput),
     new ActionRowBuilder().addComponents(amountInput),
     new ActionRowBuilder().addComponents(rewardInput),
-    new ActionRowBuilder().addComponents(typeInput),
     new ActionRowBuilder().addComponents(noteInput)
   );
 
@@ -266,7 +259,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isButton()) {
       if (interaction.customId === "create") {
-        await interaction.showModal(buildQuestModal());
+        const select = new StringSelectMenuBuilder()
+          .setCustomId("select_quest_type")
+          .setPlaceholder("Welche Art von Gesuch moechtest du aushaengen?")
+          .addOptions([
+            {
+              label: "Privates Gesuch",
+              value: "private",
+              description: "Ein Gesuch im eigenen Namen",
+            },
+            {
+              label: "Gildengesuch",
+              value: "guild",
+              description: "Ein Gesuch im Namen der Gilde",
+            },
+          ]);
+
+        const row = new ActionRowBuilder().addComponents(select);
+
+        await interaction.reply({
+          content: "Waehle die Art des Gesuchs.",
+          components: [row],
+          flags: 64,
+        });
         return;
       }
 
@@ -468,12 +483,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.isModalSubmit()) {
-      if (interaction.customId !== "modal_create_quest") return;
+      if (
+        interaction.customId !== "modal_create_private_quest" &&
+        interaction.customId !== "modal_create_guild_quest"
+      ) {
+        return;
+      }
+
+      const isGuildQuest = interaction.customId === "modal_create_guild_quest";
+
+      if (isGuildQuest && !isLeitung(interaction.member)) {
+        await interaction.reply({
+          content: "Nur die Leitung darf Gildengesuche aushaengen.",
+          flags: 64,
+        });
+        return;
+      }
 
       const title = interaction.fields.getTextInputValue("title").trim();
       const amountRaw = interaction.fields.getTextInputValue("amount").trim();
       const reward = interaction.fields.getTextInputValue("reward").trim();
-      const questTypeRaw = interaction.fields.getTextInputValue("quest_type").trim().toLowerCase();
       const note = interaction.fields.getTextInputValue("note").trim();
 
       const amount = Number(amountRaw);
@@ -485,24 +514,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
         return;
       }
-
-      if (questTypeRaw !== "privat" && questTypeRaw !== "gilde") {
-        await interaction.reply({
-          content: "Beim Typ bitte nur 'privat' oder 'gilde' eintragen.",
-          flags: 64,
-        });
-        return;
-      }
-
-      if (questTypeRaw === "gilde" && !isLeitung(interaction.member)) {
-        await interaction.reply({
-          content: "Nur die Leitung darf Gildengesuche aushaengen.",
-          flags: 64,
-        });
-        return;
-      }
-
-      const isGuildQuest = questTypeRaw === "gilde";
 
       const payload = {
         type: isGuildQuest ? "GUILD" : "NORMAL",
@@ -543,6 +554,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.isStringSelectMenu()) {
+      if (interaction.customId === "select_quest_type") {
+        const selectedType = interaction.values[0];
+
+        if (selectedType === "private") {
+          await interaction.showModal(buildQuestModal("NORMAL"));
+          return;
+        }
+
+        if (selectedType === "guild") {
+          if (!isLeitung(interaction.member)) {
+            await interaction.update({
+              content: "Nur die Leitung darf Gildengesuche aushaengen.",
+              components: [],
+            });
+            return;
+          }
+
+          await interaction.showModal(buildQuestModal("GUILD"));
+          return;
+        }
+      }
+
       if (interaction.customId === "select_accept_quest") {
         const questId = Number(interaction.values[0]);
 
@@ -669,15 +702,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.isRepliable()) {
       if (interaction.deferred || interaction.replied) {
-        await interaction.followUp({
-          content: "Es ist ein Fehler aufgetreten.",
-          flags: 64,
-        }).catch(() => {});
+        await interaction
+          .followUp({
+            content: "Es ist ein Fehler aufgetreten.",
+            flags: 64,
+          })
+          .catch(() => {});
       } else {
-        await interaction.reply({
-          content: "Es ist ein Fehler aufgetreten.",
-          flags: 64,
-        }).catch(() => {});
+        await interaction
+          .reply({
+            content: "Es ist ein Fehler aufgetreten.",
+            flags: 64,
+          })
+          .catch(() => {});
       }
     }
   }
