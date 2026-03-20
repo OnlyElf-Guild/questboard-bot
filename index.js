@@ -1,4 +1,5 @@
 require("dotenv").config();
+const http = require("http");
 const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require("discord.js");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -130,5 +131,14 @@ client.on("interactionCreate", async interaction => {
     await interaction.reply({ content: "Annehmen Funktion folgt 🙂", ephemeral: true });
   }
 });
+const PORT = process.env.PORT || 10000;
 
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("Questboard bot is running");
+  })
+  .listen(PORT, "0.0.0.0", () => {
+    console.log(`Health server listening on ${PORT}`);
+  });
 client.login(process.env.DISCORD_TOKEN);
