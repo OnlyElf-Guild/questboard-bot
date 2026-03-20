@@ -93,23 +93,31 @@ async function renderBoard(message) {
     .setFooter({ text: "Aushangtafel der Gilde" });
 
   const buttons = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("create")
-      .setLabel("📜 Aushang schreiben")
-      .setStyle(ButtonStyle.Primary),
-    new ButtonBuilder()
-      .setCustomId("guild")
-      .setLabel("🏰 Gildenaushang")
-      .setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder()
-      .setCustomId("accept")
-      .setLabel("🗡 Auftrag annehmen")
-      .setStyle(ButtonStyle.Success),
-    new ButtonBuilder()
-      .setCustomId("refresh")
-      .setLabel("🕯 Brett erneuern")
-      .setStyle(ButtonStyle.Secondary)
-  );
+  new ButtonBuilder()
+    .setCustomId("create")
+    .setLabel("📜 Aushang schreiben")
+    .setStyle(ButtonStyle.Primary),
+
+  new ButtonBuilder()
+    .setCustomId("guild")
+    .setLabel("🏰 Gildenaushang")
+    .setStyle(ButtonStyle.Primary), // ← jetzt auch blau
+
+  new ButtonBuilder()
+    .setCustomId("accept")
+    .setLabel("🗡 Auftrag annehmen")
+    .setStyle(ButtonStyle.Success),
+
+  new ButtonBuilder()
+    .setCustomId("deliver")
+    .setLabel("📦 Auftrag abgeben")
+    .setStyle(ButtonStyle.Secondary),
+
+  new ButtonBuilder()
+    .setCustomId("refresh")
+    .setLabel("🕯 Brett erneuern")
+    .setStyle(ButtonStyle.Secondary)
+);
 
   await message.edit({
     content: "",
@@ -274,6 +282,49 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
+        if (interaction.customId === "deliver") {
+
+  const { data: activeQuest, error } = await supabase
+    .from("guild_quests")
+    .select("*")
+    .eq("claimed_by_id", interaction.user.id)
+    .eq("status", "CLAIMED")
+    .maybeSingle();
+
+  if (error) {
+    console.error(error);
+    await interaction.reply({
+      content: "Dein Auftrag konnte nicht gefunden werden.",
+      flags: 64,
+    });
+    return;
+  }
+
+  if (!activeQuest) {
+    await interaction.reply({
+      content: "Du hast aktuell keinen Auftrag zur Abgabe.",
+      flags: 64,
+    });
+    return;
+  }
+
+  await supabase
+    .from("guild_quests")
+    .update({
+      status: "AWAITING_CONFIRMATION",
+      delivered_at: new Date().toISOString(),
+    })
+    .eq("id", activeQuest.id);
+
+  await refreshBoard();
+
+  await interaction.reply({
+    content: `Du hast Auftrag #${activeQuest.id} zur Abnahme abgegeben.`,
+    flags: 64,
+  });
+
+  return;
+}
         const { data: openQuests, error } = await supabase
           .from("guild_quests")
           .select("id, title, amount, guild_created, created_by_id")
