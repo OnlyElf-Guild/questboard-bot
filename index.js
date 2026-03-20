@@ -78,96 +78,95 @@ async function renderBoard(message) {
     .order("id", { ascending: true });
 
   if (error) {
-    console.error("Fehler beim Laden der Quests:", error);
+    console.error("Fehler beim Laden der Gesuche:", error);
     return;
   }
 
-  const open = quests.filter((q) => q.status === "OPEN");
-  const claimed = quests.filter((q) => q.status === "CLAIMED");
-  const confirm = quests.filter((q) => q.status === "AWAITING_CONFIRMATION");
+  const open = quests.filter(q => q.status === "OPEN");
+  const claimed = quests.filter(q => q.status === "CLAIMED");
+  const confirm = quests.filter(q => q.status === "AWAITING_CONFIRMATION");
 
   const embed = new EmbedBuilder()
-    .setTitle("📜 Gildenauftragsbrett")
-    .setColor(0xc8a45d)
+    .setTitle("📜 Schwarzes Brett der Gilde")
+    .setColor(0x9b6b2f)
     .setDescription(buildBoardText(open, claimed, confirm))
-    .setFooter({ text: "Aushangtafel der Gilde" });
+    .setFooter({ text: "Aushang der Gildenhalle" });
 
   const buttons = new ActionRowBuilder().addComponents(
-  new ButtonBuilder()
-    .setCustomId("create")
-    .setLabel("📜 Aushang schreiben")
-    .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId("create")
+      .setLabel("📜 Gesuch aushaengen")
+      .setStyle(ButtonStyle.Primary),
 
-  new ButtonBuilder()
-    .setCustomId("guild")
-    .setLabel("🏰 Gildenaushang")
-    .setStyle(ButtonStyle.Primary), // ← jetzt auch blau
+    new ButtonBuilder()
+      .setCustomId("guild")
+      .setLabel("🏰 Gildengesuch")
+      .setStyle(ButtonStyle.Primary),
 
-  new ButtonBuilder()
-    .setCustomId("accept")
-    .setLabel("🗡 Auftrag annehmen")
-    .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId("accept")
+      .setLabel("🗡 Auftrag annehmen")
+      .setStyle(ButtonStyle.Success),
 
-  new ButtonBuilder()
-    .setCustomId("deliver")
-    .setLabel("📦 Auftrag abgeben")
-    .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("deliver")
+      .setLabel("🍺 Rueckkehr melden")
+      .setStyle(ButtonStyle.Secondary),
 
-  new ButtonBuilder()
-    .setCustomId("refresh")
-    .setLabel("🕯 Brett erneuern")
-    .setStyle(ButtonStyle.Secondary)
-);
+    new ButtonBuilder()
+      .setCustomId("refresh")
+      .setLabel("🕯 Brett erneuern")
+      .setStyle(ButtonStyle.Secondary)
+  );
 
   await message.edit({
     content: "",
     embeds: [embed],
-    components: [buttons],
+    components: [buttons]
   });
 }
 
 function buildBoardText(open, claimed, confirm) {
   let text = "";
 
-  text += "╔════════ **Anschlagbrett** ════════╗\n";
+  text += "╔════════ **Offene Gesuche** ════════╗\n";
   if (!open.length) {
-    text += "_Zur Zeit haengt kein neuer Auftrag aus._\n";
+    text += "_Zur Zeit haengt kein neues Gesuch aus._\n";
   } else {
-    open.forEach((q) => {
+    open.forEach(q => {
       const creator = q.guild_created ? "Die Gilde" : q.created_by_name;
       text += `**#${q.id}**  ${q.amount}x ${q.title}\n`;
-      text += `Belohnung: ${q.reward || "keine"}\n`;
-      text += `Ausgehängt von: ${creator}\n\n`;
+      text += `Lohn: ${q.reward || "nicht ausgeschrieben"}\n`;
+      text += `Ausgehaengt von: ${creator}\n\n`;
     });
   }
-  text += "╚═══════════════════════════════════╝\n\n";
+  text += "╚════════════════════════════════════╝\n\n";
 
-  text += "╔════════ **Auf Reisen** ═══════════╗\n";
+  text += "╔════ **Ausgesandte Abenteurer** ════╗\n";
   if (!claimed.length) {
     text += "_Derzeit ist kein Abenteurer ausgesandt._\n";
   } else {
-    claimed.forEach((q) => {
+    claimed.forEach(q => {
       text += `**#${q.id}**  ${q.amount}x ${q.title}\n`;
-      text += `Abenteurer: ${q.claimed_by_name}\n\n`;
+      text += `Unterwegs: ${q.claimed_by_name}\n\n`;
     });
   }
-  text += "╚═══════════════════════════════════╝\n\n";
+  text += "╚════════════════════════════════════╝\n\n";
 
-  text += "╔════════ **Zur Abnahme** ══════════╗\n";
+  text += "╔════ **Rueckkehr vor dem Rat** ═════╗\n";
   if (!confirm.length) {
-    text += "_Keine Rueckkehr wartet auf Bestaetigung._\n";
+    text += "_Zur Zeit wartet kein Abenteurer auf Abnahme._\n";
   } else {
-    confirm.forEach((q) => {
+    confirm.forEach(q => {
       text += `**#${q.id}**  ${q.amount}x ${q.title}\n`;
-      text += `Abgegeben von: ${q.claimed_by_name}\n`;
+      text += `Zurueckgekehrt: ${q.claimed_by_name}\n`;
       text += "Wartet auf Bestaetigung\n\n";
     });
   }
-  text += "╚═══════════════════════════════════╝";
+  text += "╚════════════════════════════════════╝";
 
   return text;
 }
-
 function buildQuestModal(type = "NORMAL") {
   const isGuild = type === "GUILD";
 
@@ -282,8 +281,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (interaction.customId === "deliver") {
-
+if (interaction.customId === "deliver") {
   const { data: activeQuest, error } = await supabase
     .from("guild_quests")
     .select("*")
@@ -292,9 +290,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     .maybeSingle();
 
   if (error) {
-    console.error(error);
+    console.error("Fehler beim Laden des aktiven Auftrags:", error);
     await interaction.reply({
-      content: "Dein Auftrag konnte nicht gefunden werden.",
+      content: "Dein laufender Auftrag konnte nicht gefunden werden.",
       flags: 64,
     });
     return;
@@ -302,24 +300,34 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   if (!activeQuest) {
     await interaction.reply({
-      content: "Du hast aktuell keinen Auftrag zur Abgabe.",
+      content: "Du hast derzeit keinen Auftrag, dessen Rueckkehr du melden kannst.",
       flags: 64,
     });
     return;
   }
 
-  await supabase
+  const { error: updateError } = await supabase
     .from("guild_quests")
     .update({
       status: "AWAITING_CONFIRMATION",
-      delivered_at: new Date().toISOString(),
+      submitted_at: new Date().toISOString(), // wichtig: submitted_at, nicht delivered_at
     })
-    .eq("id", activeQuest.id);
+    .eq("id", activeQuest.id)
+    .eq("status", "CLAIMED");
+
+  if (updateError) {
+    console.error("Fehler beim Melden der Rueckkehr:", updateError);
+    await interaction.reply({
+      content: "Deine Rueckkehr konnte nicht am Brett vermerkt werden.",
+      flags: 64,
+    });
+    return;
+  }
 
   await refreshBoard();
 
   await interaction.reply({
-    content: `Du hast Auftrag #${activeQuest.id} zur Abnahme abgegeben.`,
+    content: `Deine Rueckkehr fuer Gesuch #${activeQuest.id} wurde am Brett vermerkt.`,
     flags: 64,
   });
 
