@@ -82,6 +82,131 @@ async function initQuestBoard() {
   await renderBoard(newMsg);
 }
 
+async function getQuestClaims(questId) {
+  const { data, error } = await supabase
+    .from("guild_quest_claims")
+    .select("*")
+    .eq("quest_id", questId)
+    .in("status", ["CLAIMED", "AWAITING_CONFIRMATION", "DONE"])
+    .order("claimed_at", { ascending: true });
+
+  if (error) {
+    console.error("Fehler beim Laden der Claims:", error);
+    return [];
+  }
+
+  return data || [];
+}
+
+async function getActiveClaimsForQuest(questId) {
+  const { data, error } = await supabase
+    .from("guild_quest_claims")
+    .select("*")
+    .eq("quest_id", questId)
+    .in("status", ["CLAIMED", "AWAITING_CONFIRMATION"])
+    .order("claimed_at", { ascending: true });
+
+  if (error) {
+    console.error("Fehler beim Laden aktiver Claims:", error);
+    return [];
+  }
+
+  return data || [];
+}
+
+async function getUserActiveNonGroupClaim(userId) {
+  const { data, error } = await supabase
+    .from("guild_quest_claims")
+    .select(`
+      *,
+      guild_quests!inner (
+        id,
+        category,
+        title
+      )
+    `)
+    .eq("user_id", userId)
+    .in("status", ["CLAIMED", "AWAITING_CONFIRMATION"]);
+
+  if (error) {
+    console.error("Fehler bei getUserActiveNonGroupClaim:", error);
+    return null;
+  }
+
+  return (data || []).find((row) => row.guild_quests?.category !== "Gruppe") || null;
+}
+
+async function getUserActiveGroupClaim(userId) {
+  const { data, error } = await supabase
+    .from("guild_quest_claims")
+    .select(`
+      *,
+      guild_quests!inner (
+        id,
+        category,
+        title
+      )
+    `)
+    .eq("user_id", userId)
+    .in("status", ["CLAIMED", "AWAITING_CONFIRMATION"]);
+
+  if (error) {
+    console.error("Fehler bei getUserActiveGroupClaim:", error);
+    return null;
+  }
+
+  return (data || []).find((row) => row.guild_quests?.category === "Gruppe") || null;
+}
+
+async function getUserClaimForQuest(userId, questId) {
+  const { data, error } = await supabase
+    .from("guild_quest_claims")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("quest_id", questId)
+    .in("status", ["CLAIMED", "AWAITING_CONFIRMATION"])
+    .maybeSingle();
+
+  if (error) {
+    console.error("Fehler bei getUserClaimForQuest:", error);
+    return null;
+  }
+
+  return data || null;
+}
+
+async function refreshQuestStatusFromClaims(questId) {
+  const { data: quest, error: questError } = await supabase
+    .from("guild_quests")
+    .select("*")
+    .eq("id", questId)
+    .single();
+
+  if (questError || !quest) return;
+
+  const claims = await getActiveClaimsForQuest(questId);
+
+  let status = "OPEN";
+
+  if (claims.length === 0) {
+    status = "OPEN";
+  } else {
+    const hasClaimed = claims.some((c) => c.status === "CLAIMED");
+    const hasAwaiting = claims.some((c) => c.status === "AWAITING_CONFIRMATION");
+
+    if (hasAwaiting && !hasClaimed) {
+      status = "AWAITING_CONFIRMATION";
+    } else {
+      status = "CLAIMED";
+    }
+  }
+
+  await supabase
+    .from("guild_quests")
+    .update({ status })
+    .eq("id", questId);
+}
+
 async function renderBoard(message) {
   const { data: quests, error } = await supabase
     .from("guild_quests")
@@ -94,9 +219,16 @@ async function renderBoard(message) {
     return;
   }
 
-  const open = quests.filter((q) => q.status === "OPEN");
-  const claimed = quests.filter((q) => q.status === "CLAIMED");
-  const confirm = quests.filter((q) => q.status === "AWAITING_CONFIRMATION");
+  const questsWithClaims = await Promise.all(
+    quests.map(async (q) => {
+      const claims = await getQuestClaims(q.id);
+      return { ...q, claims };
+    })
+  );
+
+  const open = questsWithClaims.filter((q) => q.status === "OPEN");
+  const claimed = questsWithClaims.filter((q) => q.status === "CLAIMED");
+  const confirm = questsWithClaims.filter((q) => q.status === "AWAITING_CONFIRMATION");
 
   const embed = new EmbedBuilder()
     .setTitle("📜 Schwarzes Brett der Gilde")
@@ -184,12 +316,45 @@ function formatQuestLine(q, options = {}) {
     text += `Lohn: ${q.reward}\n`;
   }
 
+  if (category === "Gruppe") {
+    const activeClaims = (q.claims || []).filter(
+      (c) => c.status === "CLAIMED" || c.status === "AWAITING_CONFIRMATION"
+    );
+    const claimNames = activeClaims.map((c) => c.user_name);
+
+    text += `Plaetze: ${claimNames.length}/${q.max_claims || 4} belegt\n`;
+
+    if (claimNames.length) {
+      text += `Teilnehmer: ${claimNames.join(", ")}\n`;
+    }
+  }
+
   if (options.traveler) {
-    text += `Unterwegs: ${q.claimed_by_name}\n`;
+    if (category !== "Gruppe") {
+      const activeClaim = (q.claims || []).find((c) => c.status === "CLAIMED");
+      if (activeClaim) {
+        text += `Unterwegs: ${activeClaim.user_name}\n`;
+      }
+    }
   } else if (options.confirmation) {
-    const confirmer = q.guild_created ? "Leitung" : q.created_by_name;
-    text += `Versandt von: ${q.claimed_by_name}\n`;
-    text += `Bestaetigung durch: ${confirmer}\n`;
+    if (category !== "Gruppe") {
+      const waitingClaim = (q.claims || []).find(
+        (c) => c.status === "AWAITING_CONFIRMATION"
+      );
+      const confirmer = q.guild_created ? "Leitung" : q.created_by_name;
+      if (waitingClaim) {
+        text += `Versandt von: ${waitingClaim.user_name}\n`;
+        text += `Bestaetigung durch: ${confirmer}\n`;
+      }
+    } else {
+      const waitingClaimNames = (q.claims || [])
+        .filter((c) => c.status === "AWAITING_CONFIRMATION")
+        .map((c) => c.user_name);
+
+      if (waitingClaimNames.length) {
+        text += `Warten auf Bestaetigung: ${waitingClaimNames.join(", ")}\n`;
+      }
+    }
   } else {
     text += `Ausgehaengt von: ${creator}\n`;
   }
@@ -273,21 +438,6 @@ async function refreshBoard() {
   await renderBoard(msg);
 }
 
-async function userHasActiveQuest(userId) {
-  const { data, error } = await supabase
-    .from("guild_quests")
-    .select("id, status")
-    .eq("claimed_by_id", userId)
-    .in("status", ["CLAIMED", "AWAITING_CONFIRMATION"]);
-
-  if (error) {
-    console.error("Fehler bei userHasActiveQuest:", error);
-    return true;
-  }
-
-  return data.length > 0;
-}
-
 function truncateLabel(text, maxLen) {
   if (text.length <= maxLen) return text;
   return text.slice(0, maxLen - 1) + "…";
@@ -324,19 +474,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (interaction.customId === "accept") {
-        const hasActive = await userHasActiveQuest(interaction.user.id);
-        if (hasActive) {
-          await interaction.reply({
-            content: "Du hast bereits einen aktiven Auftrag.",
-            flags: 64,
-          });
-          return;
-        }
+        const activeNonGroup = await getUserActiveNonGroupClaim(interaction.user.id);
+        const activeGroup = await getUserActiveGroupClaim(interaction.user.id);
 
         const { data: openQuests, error } = await supabase
           .from("guild_quests")
-          .select("id, title, category, details, guild_created, created_by_id")
-          .eq("status", "OPEN")
+          .select("id, title, category, details, guild_created, created_by_id, max_claims, status")
+          .in("status", ["OPEN", "CLAIMED"])
           .order("id", { ascending: true })
           .limit(25);
 
@@ -349,14 +493,42 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const filtered = openQuests.filter((q) => {
-          if (q.guild_created) return true;
-          return q.created_by_id !== interaction.user.id;
+        const enriched = await Promise.all(
+          openQuests.map(async (q) => {
+            const claims = await getActiveClaimsForQuest(q.id);
+            return { ...q, claims };
+          })
+        );
+
+        const filtered = enriched.filter((q) => {
+          if (!q.guild_created && q.created_by_id === interaction.user.id) {
+            return false;
+          }
+
+          const activeCount = q.claims.length;
+          const maxClaims = q.max_claims || 1;
+
+          if (activeCount >= maxClaims) {
+            return false;
+          }
+
+          const alreadyJoined = q.claims.some((c) => c.user_id === interaction.user.id);
+          if (alreadyJoined) {
+            return false;
+          }
+
+          if (q.category === "Gruppe") {
+            if (activeGroup) return false;
+            return true;
+          }
+
+          if (activeNonGroup) return false;
+          return true;
         });
 
         if (!filtered.length) {
           await interaction.reply({
-            content: "Es gibt derzeit kein Gesuch, das du annehmen kannst.",
+            content: "Es gibt derzeit kein passendes Gesuch, das du annehmen kannst.",
             flags: 64,
           });
           return;
@@ -369,7 +541,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
             filtered.map((q) => ({
               label: `#${q.id} [${q.category || "Waren"}] ${truncateLabel(q.title, 60)}`,
               value: String(q.id),
-              description: truncateLabel(q.details || "Ohne weitere Angaben", 90),
+              description:
+                q.category === "Gruppe"
+                  ? truncateLabel(
+                      `${q.claims.length}/${q.max_claims || 4} belegt • ${q.details || "Ohne Angaben"}`,
+                      90
+                    )
+                  : truncateLabel(q.details || "Ohne weitere Angaben", 90),
             }))
           );
 
@@ -384,59 +562,73 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (interaction.customId === "deliver") {
-        const { data: activeQuest, error } = await supabase
-          .from("guild_quests")
-          .select("*")
-          .eq("claimed_by_id", interaction.user.id)
-          .eq("status", "CLAIMED")
-          .maybeSingle();
+        const activeNonGroup = await getUserActiveNonGroupClaim(interaction.user.id);
+        const activeGroup = await getUserActiveGroupClaim(interaction.user.id);
 
-        if (error) {
-          console.error("Fehler beim Laden des aktiven Gesuchs:", error);
+        const candidates = [activeNonGroup, activeGroup].filter(Boolean);
+
+        if (!candidates.length) {
           await interaction.reply({
-            content: "Dein laufendes Gesuch konnte nicht gefunden werden.",
+            content: "Du hast derzeit keinen aktiven Auftrag, den du als abgegeben melden kannst.",
             flags: 64,
           });
           return;
         }
 
-        if (!activeQuest) {
+        if (candidates.length === 1) {
+          const claim = candidates[0];
+
+          const { error: updateError } = await supabase
+            .from("guild_quest_claims")
+            .update({
+              status: "AWAITING_CONFIRMATION",
+              submitted_at: new Date().toISOString(),
+            })
+            .eq("id", claim.id)
+            .eq("status", "CLAIMED");
+
+          if (updateError) {
+            console.error("Fehler beim Melden als abgegeben:", updateError);
+            await interaction.reply({
+              content: "Der Auftrag konnte nicht als abgegeben vermerkt werden.",
+              flags: 64,
+            });
+            return;
+          }
+
+          await refreshQuestStatusFromClaims(claim.quest_id);
+          await refreshBoard();
+
           await interaction.reply({
-            content: "Du hast derzeit keinen Auftrag, den du als abgegeben melden kannst.",
+            content: `Dein Beitrag zu Gesuch #${claim.quest_id} wurde als abgegeben vermerkt.`,
             flags: 64,
           });
           return;
         }
 
-        const { error: updateError } = await supabase
-          .from("guild_quests")
-          .update({
-            status: "AWAITING_CONFIRMATION",
-            submitted_at: new Date().toISOString(),
-          })
-          .eq("id", activeQuest.id)
-          .eq("status", "CLAIMED");
+        const select = new StringSelectMenuBuilder()
+          .setCustomId("select_deliver_claim")
+          .setPlaceholder("Welchen Auftrag moechtest du abgeben?")
+          .addOptions(
+            candidates.slice(0, 25).map((c) => ({
+              label: `#${c.quest_id} [${c.guild_quests.category}] ${truncateLabel(c.guild_quests.title, 60)}`,
+              value: String(c.id),
+              description: truncateLabel(c.guild_quests.details || "Ohne weitere Angaben", 90),
+            }))
+          );
 
-        if (updateError) {
-          console.error("Fehler beim Melden als abgegeben:", updateError);
-          await interaction.reply({
-            content: "Der Auftrag konnte nicht als abgegeben vermerkt werden.",
-            flags: 64,
-          });
-          return;
-        }
-
-        await refreshBoard();
+        const row = new ActionRowBuilder().addComponents(select);
 
         await interaction.reply({
-          content: `Gesuch #${activeQuest.id} wurde als abgegeben vermerkt.`,
+          content: "Welchen aktiven Auftrag moechtest du als abgegeben markieren?",
+          components: [row],
           flags: 64,
         });
         return;
       }
 
       if (interaction.customId === "complete") {
-        const { data: waitingQuests, error } = await supabase
+        const { data: quests, error } = await supabase
           .from("guild_quests")
           .select("*")
           .eq("status", "AWAITING_CONFIRMATION")
@@ -451,14 +643,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const eligible = waitingQuests.filter((q) => {
-          if (q.guild_created) {
-            return isLeitung(interaction.member);
-          }
+        const eligibleQuests = quests.filter((q) => {
+          if (q.guild_created) return isLeitung(interaction.member);
           return q.created_by_id === interaction.user.id;
         });
 
-        if (!eligible.length) {
+        if (!eligibleQuests.length) {
           await interaction.reply({
             content: "Du kannst derzeit kein wartendes Gesuch als erledigt bestaetigen.",
             flags: 64,
@@ -466,41 +656,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        if (eligible.length === 1) {
-          const quest = eligible[0];
-
-          const { error: doneError } = await supabase
-            .from("guild_quests")
-            .update({
-              status: "DONE",
-              confirmed_at: new Date().toISOString(),
-            })
-            .eq("id", quest.id)
-            .eq("status", "AWAITING_CONFIRMATION");
-
-          if (doneError) {
-            console.error("Fehler beim Abschliessen des Gesuchs:", doneError);
-            await interaction.reply({
-              content: "Das Gesuch konnte nicht als erledigt markiert werden.",
-              flags: 64,
-            });
-            return;
-          }
-
-          await refreshBoard();
-
-          await interaction.reply({
-            content: `Gesuch #${quest.id} wurde als erledigt bestaetigt.`,
-            flags: 64,
-          });
-          return;
-        }
-
         const select = new StringSelectMenuBuilder()
           .setCustomId("select_complete_quest")
-          .setPlaceholder("Welches Gesuch ist erledigt?")
+          .setPlaceholder("Welches Gesuch moechtest du bestaetigen?")
           .addOptions(
-            eligible.slice(0, 25).map((q) => ({
+            eligibleQuests.slice(0, 25).map((q) => ({
               label: `#${q.id} [${q.category || "Waren"}] ${truncateLabel(q.title, 60)}`,
               value: String(q.id),
               description: truncateLabel(q.details || "Ohne weitere Angaben", 90),
@@ -564,6 +724,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         details,
         reward: reward || null,
         note: note || null,
+        max_claims: category === "Gruppe" ? 4 : 1,
         created_by_id: interaction.user.id,
         created_by_name: interaction.member?.displayName || interaction.user.username,
         guild_created: isGuildQuest,
@@ -645,7 +806,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         await interaction.showModal(
-          buildQuestModal(isGuildQuest ? "GUILD" : "NORMAL", category === "waren" ? "Waren" : category === "gruppe" ? "Gruppe" : "Sonstiges")
+          buildQuestModal(
+            isGuildQuest ? "GUILD" : "NORMAL",
+            category === "waren"
+              ? "Waren"
+              : category === "gruppe"
+              ? "Gruppe"
+              : "Sonstiges"
+          )
         );
         return;
       }
@@ -653,20 +821,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.customId === "select_accept_quest") {
         const questId = Number(interaction.values[0]);
 
-        const hasActive = await userHasActiveQuest(interaction.user.id);
-        if (hasActive) {
-          await interaction.update({
-            content: "Du hast bereits einen aktiven Auftrag.",
-            components: [],
-          });
-          return;
-        }
-
         const { data: quest, error } = await supabase
           .from("guild_quests")
           .select("*")
+          .in("status", ["OPEN", "CLAIMED"])
           .eq("id", questId)
-          .eq("status", "OPEN")
           .single();
 
         if (error || !quest) {
@@ -685,19 +844,58 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const { error: updateError } = await supabase
-          .from("guild_quests")
-          .update({
-            status: "CLAIMED",
-            claimed_by_id: interaction.user.id,
-            claimed_by_name: interaction.member?.displayName || interaction.user.username,
-            claimed_at: new Date().toISOString(),
-          })
-          .eq("id", questId)
-          .eq("status", "OPEN");
+        const existingClaim = await getUserClaimForQuest(interaction.user.id, questId);
+        if (existingClaim) {
+          await interaction.update({
+            content: "Du bist diesem Gesuch bereits zugeordnet.",
+            components: [],
+          });
+          return;
+        }
 
-        if (updateError) {
-          console.error("Fehler beim Annehmen:", updateError);
+        const currentClaims = await getActiveClaimsForQuest(questId);
+        const maxClaims = quest.max_claims || 1;
+
+        if (currentClaims.length >= maxClaims) {
+          await interaction.update({
+            content: "Dieses Gesuch ist bereits voll besetzt.",
+            components: [],
+          });
+          return;
+        }
+
+        if (quest.category === "Gruppe") {
+          const activeGroup = await getUserActiveGroupClaim(interaction.user.id);
+          if (activeGroup) {
+            await interaction.update({
+              content: "Du hast bereits einen aktiven Gruppenplatz.",
+              components: [],
+            });
+            return;
+          }
+        } else {
+          const activeNonGroup = await getUserActiveNonGroupClaim(interaction.user.id);
+          if (activeNonGroup) {
+            await interaction.update({
+              content: "Du hast bereits einen aktiven Waren- oder Sonstiges-Auftrag.",
+              components: [],
+            });
+            return;
+          }
+        }
+
+        const { error: claimError } = await supabase
+          .from("guild_quest_claims")
+          .insert({
+            quest_id: questId,
+            user_id: interaction.user.id,
+            user_name: interaction.member?.displayName || interaction.user.username,
+            status: "CLAIMED",
+            claimed_at: new Date().toISOString(),
+          });
+
+        if (claimError) {
+          console.error("Fehler beim Annehmen:", claimError);
           await interaction.update({
             content: "Das Gesuch konnte nicht angenommen werden.",
             components: [],
@@ -705,10 +903,61 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
+        await refreshQuestStatusFromClaims(questId);
         await refreshBoard();
 
         await interaction.update({
-          content: `Du hast dich fuer Gesuch #${questId} verpflichtet.`,
+          content:
+            quest.category === "Gruppe"
+              ? `Du hast einen Platz in Gesuch #${questId} uebernommen.`
+              : `Du hast dich fuer Gesuch #${questId} verpflichtet.`,
+          components: [],
+        });
+        return;
+      }
+
+      if (interaction.customId === "select_deliver_claim") {
+        const claimId = Number(interaction.values[0]);
+
+        const { data: claim, error } = await supabase
+          .from("guild_quest_claims")
+          .select("*")
+          .eq("id", claimId)
+          .eq("user_id", interaction.user.id)
+          .eq("status", "CLAIMED")
+          .single();
+
+        if (error || !claim) {
+          await interaction.update({
+            content: "Dieser Auftrag kann nicht mehr als abgegeben markiert werden.",
+            components: [],
+          });
+          return;
+        }
+
+        const { error: updateError } = await supabase
+          .from("guild_quest_claims")
+          .update({
+            status: "AWAITING_CONFIRMATION",
+            submitted_at: new Date().toISOString(),
+          })
+          .eq("id", claimId)
+          .eq("status", "CLAIMED");
+
+        if (updateError) {
+          console.error("Fehler beim Abgeben des Claims:", updateError);
+          await interaction.update({
+            content: "Der Auftrag konnte nicht als abgegeben markiert werden.",
+            components: [],
+          });
+          return;
+        }
+
+        await refreshQuestStatusFromClaims(claim.quest_id);
+        await refreshBoard();
+
+        await interaction.update({
+          content: `Dein Beitrag zu Gesuch #${claim.quest_id} wurde als abgegeben vermerkt.`,
           components: [],
         });
         return;
@@ -744,13 +993,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
+        const { data: waitingClaims, error: claimsError } = await supabase
+          .from("guild_quest_claims")
+          .select("*")
+          .eq("quest_id", questId)
+          .eq("status", "AWAITING_CONFIRMATION");
+
+        if (claimsError || !waitingClaims.length) {
+          await interaction.update({
+            content: "Zu diesem Gesuch gibt es derzeit nichts zu bestaetigen.",
+            components: [],
+          });
+          return;
+        }
+
         const { error: doneError } = await supabase
-          .from("guild_quests")
+          .from("guild_quest_claims")
           .update({
             status: "DONE",
             confirmed_at: new Date().toISOString(),
           })
-          .eq("id", questId)
+          .eq("quest_id", questId)
           .eq("status", "AWAITING_CONFIRMATION");
 
         if (doneError) {
@@ -762,10 +1025,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
+        const remainingActiveClaims = await getActiveClaimsForQuest(questId);
+
+        if (remainingActiveClaims.length === 0) {
+          await supabase
+            .from("guild_quests")
+            .update({
+              status: "DONE",
+              confirmed_at: new Date().toISOString(),
+            })
+            .eq("id", questId);
+        } else {
+          await refreshQuestStatusFromClaims(questId);
+        }
+
         await refreshBoard();
 
         await interaction.update({
-          content: `Gesuch #${questId} wurde als erledigt bestaetigt.`,
+          content:
+            quest.category === "Gruppe"
+              ? `Alle wartenden Rueckmeldungen fuer Gesuch #${questId} wurden bestaetigt.`
+              : `Gesuch #${questId} wurde als erledigt bestaetigt.`,
           components: [],
         });
         return;
