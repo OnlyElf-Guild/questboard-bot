@@ -68,14 +68,15 @@ async function renderBoard(message) {
 
   const embed = new EmbedBuilder()
     .setTitle("📜 Gildenauftragsbrett")
-    .setColor(0xf1c40f)
-    .setDescription(buildBoardText(open, claimed, confirm));
+    .setColor(0xc8a45d)
+    .setDescription(buildBoardText(open, claimed, confirm))
+    .setFooter({ text: "Aushangtafel der Gilde" });
 
   const buttons = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("create").setLabel("➕ Auftrag erstellen").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("guild").setLabel("🏰 Gildenauftrag").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("accept").setLabel("🤝 Annehmen").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("refresh").setLabel("🔄 Aktualisieren").setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId("create").setLabel("📜 Aushang schreiben").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("guild").setLabel("🏰 Gildenaushang").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("accept").setLabel("🗡 Auftrag annehmen").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("refresh").setLabel("🕯 Brett erneuern").setStyle(ButtonStyle.Secondary)
   );
 
   await message.edit({
@@ -88,23 +89,41 @@ async function renderBoard(message) {
 function buildBoardText(open, claimed, confirm) {
   let text = "";
 
-  text += "🟢 **Offen**\n";
-  if (!open.length) text += "_Keine Aufträge_\n";
-  open.forEach(q => {
-    text += `#${q.id} ${q.amount}x ${q.title} — ${q.reward || "keine Belohnung"}\n`;
-  });
+  text += "╔════════ **Anschlagbrett** ════════╗\n";
+  if (!open.length) {
+    text += "_Zur Zeit haengt kein neuer Auftrag aus._\n";
+  } else {
+    open.forEach(q => {
+      const creator = q.guild_created ? "Die Gilde" : q.created_by_name;
+      text += `**#${q.id}**  ${q.amount}x ${q.title}\n`;
+      text += `Belohnung: ${q.reward || "keine"}\n`;
+      text += `Ausgehängt von: ${creator}\n\n`;
+    });
+  }
+  text += "╚═══════════════════════════════════╝\n\n";
 
-  text += "\n🟡 **In Bearbeitung**\n";
-  if (!claimed.length) text += "_Keine_\n";
-  claimed.forEach(q => {
-    text += `#${q.id} ${q.title} — ${q.claimed_by_name}\n`;
-  });
+  text += "╔════════ **Auf Reisen** ═══════════╗\n";
+  if (!claimed.length) {
+    text += "_Derzeit ist kein Abenteurer ausgesandt._\n";
+  } else {
+    claimed.forEach(q => {
+      text += `**#${q.id}**  ${q.amount}x ${q.title}\n`;
+      text += `Abenteurer: ${q.claimed_by_name}\n\n`;
+    });
+  }
+  text += "╚═══════════════════════════════════╝\n\n";
 
-  text += "\n🔵 **Wartet auf Bestätigung**\n";
-  if (!confirm.length) text += "_Keine_\n";
-  confirm.forEach(q => {
-    text += `#${q.id} ${q.title} — abgegeben von ${q.claimed_by_name}\n`;
-  });
+  text += "╔════════ **Zur Abnahme** ══════════╗\n";
+  if (!confirm.length) {
+    text += "_Keine Rueckkehr wartet auf Bestaetigung._\n";
+  } else {
+    confirm.forEach(q => {
+      text += `**#${q.id}**  ${q.amount}x ${q.title}\n`;
+      text += `Abgegeben von: ${q.claimed_by_name}\n`;
+      text += `Wartet auf Bestaetigung\n\n`;
+    });
+  }
+  text += "╚═══════════════════════════════════╝";
 
   return text;
 }
