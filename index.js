@@ -141,10 +141,7 @@ function buildBoardText(open, claimed, confirm) {
     text += "_Zur Zeit haengt kein neues Gesuch aus._\n";
   } else {
     open.forEach((q) => {
-      const creator = q.guild_created ? "Die Gilde" : q.created_by_name;
-      text += `**#${q.id}**  ${q.amount}x ${q.title}\n`;
-      text += `Lohn: ${q.reward || "nicht ausgeschrieben"}\n`;
-      text += `Ausgehaengt von: ${creator}\n\n`;
+      text += formatQuestLine(q);
     });
   }
   text += "╚════════════════════════════════════╝\n\n";
@@ -154,8 +151,7 @@ function buildBoardText(open, claimed, confirm) {
     text += "_Derzeit ist kein Abenteurer ausgesandt._\n";
   } else {
     claimed.forEach((q) => {
-      text += `**#${q.id}**  ${q.amount}x ${q.title}\n`;
-      text += `Unterwegs: ${q.claimed_by_name}\n\n`;
+      text += formatQuestLine(q, { traveler: true });
     });
   }
   text += "╚════════════════════════════════════╝\n\n";
@@ -165,10 +161,7 @@ function buildBoardText(open, claimed, confirm) {
     text += "_Zur Zeit wartet kein Gesuch auf Bestaetigung._\n";
   } else {
     confirm.forEach((q) => {
-      const confirmer = q.guild_created ? "Leitung" : q.created_by_name;
-      text += `**#${q.id}**  ${q.amount}x ${q.title}\n`;
-      text += `Versandt von: ${q.claimed_by_name}\n`;
-      text += `Bestaetigung durch: ${confirmer}\n\n`;
+      text += formatQuestLine(q, { confirmation: true });
     });
   }
   text += "╚════════════════════════════════════╝";
@@ -176,28 +169,73 @@ function buildBoardText(open, claimed, confirm) {
   return text;
 }
 
-function buildQuestModal(type = "NORMAL") {
+function formatQuestLine(q, options = {}) {
+  const creator = q.guild_created ? "Die Gilde" : q.created_by_name;
+  const category = q.category || "Waren";
+  let text = "";
+
+  text += `**#${q.id} [${category}]** ${q.title}\n`;
+
+  if (q.details) {
+    text += `Bedarf: ${q.details}\n`;
+  }
+
+  if (q.reward) {
+    text += `Lohn: ${q.reward}\n`;
+  }
+
+  if (options.traveler) {
+    text += `Unterwegs: ${q.claimed_by_name}\n`;
+  } else if (options.confirmation) {
+    const confirmer = q.guild_created ? "Leitung" : q.created_by_name;
+    text += `Versandt von: ${q.claimed_by_name}\n`;
+    text += `Bestaetigung durch: ${confirmer}\n`;
+  } else {
+    text += `Ausgehaengt von: ${creator}\n`;
+  }
+
+  if (q.note) {
+    text += `Notiz: ${q.note}\n`;
+  }
+
+  text += "\n";
+  return text;
+}
+
+function buildQuestModal(type = "NORMAL", category = "Waren") {
   const isGuildQuest = type === "GUILD";
 
   const modal = new ModalBuilder()
-    .setCustomId(isGuildQuest ? "modal_create_guild_quest" : "modal_create_private_quest")
+    .setCustomId(
+      isGuildQuest
+        ? `modal_create_guild_${category.toLowerCase()}`
+        : `modal_create_private_${category.toLowerCase()}`
+    )
     .setTitle(isGuildQuest ? "Gildengesuch aushaengen" : "Privates Gesuch aushaengen");
 
   const titleInput = new TextInputBuilder()
     .setCustomId("title")
-    .setLabel("Was wird benoetigt?")
+    .setLabel("Gesuch")
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
     .setMaxLength(100)
-    .setPlaceholder("z. B. Trank der Jadeschlange");
+    .setPlaceholder(
+      category === "Gruppe"
+        ? "z. B. Mogu Shan Heroisch"
+        : "z. B. Trank der Jadeschlange"
+    );
 
-  const amountInput = new TextInputBuilder()
-    .setCustomId("amount")
-    .setLabel("Menge")
+  const detailsInput = new TextInputBuilder()
+    .setCustomId("details")
+    .setLabel("Bedarf")
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
-    .setMaxLength(10)
-    .setPlaceholder("z. B. 50");
+    .setMaxLength(100)
+    .setPlaceholder(
+      category === "Gruppe"
+        ? "z. B. 1 Tank und 2 DD"
+        : "z. B. 50x oder 1 Stack"
+    );
 
   const rewardInput = new TextInputBuilder()
     .setCustomId("reward")
@@ -205,7 +243,7 @@ function buildQuestModal(type = "NORMAL") {
     .setStyle(TextInputStyle.Short)
     .setRequired(false)
     .setMaxLength(100)
-    .setPlaceholder("z. B. 300 Gold");
+    .setPlaceholder("z. B. 300 Gold oder Nachnahme");
 
   const noteInput = new TextInputBuilder()
     .setCustomId("note")
@@ -217,7 +255,7 @@ function buildQuestModal(type = "NORMAL") {
 
   modal.addComponents(
     new ActionRowBuilder().addComponents(titleInput),
-    new ActionRowBuilder().addComponents(amountInput),
+    new ActionRowBuilder().addComponents(detailsInput),
     new ActionRowBuilder().addComponents(rewardInput),
     new ActionRowBuilder().addComponents(noteInput)
   );
@@ -260,7 +298,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isButton()) {
       if (interaction.customId === "create") {
         const select = new StringSelectMenuBuilder()
-          .setCustomId("select_quest_type")
+          .setCustomId("select_quest_creation_type")
           .setPlaceholder("Welche Art von Gesuch moechtest du aushaengen?")
           .addOptions([
             {
@@ -278,7 +316,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const row = new ActionRowBuilder().addComponents(select);
 
         await interaction.reply({
-          content: "Waehle die Art des Gesuchs.",
+          content: "Waehle zuerst, ob es ein privates oder ein Gildengesuch ist.",
           components: [row],
           flags: 64,
         });
@@ -297,7 +335,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const { data: openQuests, error } = await supabase
           .from("guild_quests")
-          .select("id, title, amount, guild_created, created_by_id")
+          .select("id, title, category, details, guild_created, created_by_id")
           .eq("status", "OPEN")
           .order("id", { ascending: true })
           .limit(25);
@@ -329,11 +367,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setPlaceholder("Waehle ein Gesuch")
           .addOptions(
             filtered.map((q) => ({
-              label: `#${q.id} ${truncateLabel(`${q.amount}x ${q.title}`, 80)}`,
+              label: `#${q.id} [${q.category || "Waren"}] ${truncateLabel(q.title, 60)}`,
               value: String(q.id),
-              description: q.guild_created
-                ? "Gildengesuch"
-                : "Privates Gesuch",
+              description: truncateLabel(q.details || "Ohne weitere Angaben", 90),
             }))
           );
 
@@ -465,9 +501,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setPlaceholder("Welches Gesuch ist erledigt?")
           .addOptions(
             eligible.slice(0, 25).map((q) => ({
-              label: `#${q.id} ${truncateLabel(`${q.amount}x ${q.title}`, 80)}`,
+              label: `#${q.id} [${q.category || "Waren"}] ${truncateLabel(q.title, 60)}`,
               value: String(q.id),
-              description: q.guild_created ? "Gildengesuch" : "Privates Gesuch",
+              description: truncateLabel(q.details || "Ohne weitere Angaben", 90),
             }))
           );
 
@@ -483,14 +519,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.isModalSubmit()) {
-      if (
-        interaction.customId !== "modal_create_private_quest" &&
-        interaction.customId !== "modal_create_guild_quest"
-      ) {
+      const privateMatch = interaction.customId.match(/^modal_create_private_(waren|gruppe|sonstiges)$/);
+      const guildMatch = interaction.customId.match(/^modal_create_guild_(waren|gruppe|sonstiges)$/);
+
+      if (!privateMatch && !guildMatch) {
         return;
       }
 
-      const isGuildQuest = interaction.customId === "modal_create_guild_quest";
+      const isGuildQuest = Boolean(guildMatch);
+      const categoryRaw = isGuildQuest ? guildMatch[1] : privateMatch[1];
+      const category =
+        categoryRaw === "waren"
+          ? "Waren"
+          : categoryRaw === "gruppe"
+          ? "Gruppe"
+          : "Sonstiges";
 
       if (isGuildQuest && !isLeitung(interaction.member)) {
         await interaction.reply({
@@ -501,15 +544,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       const title = interaction.fields.getTextInputValue("title").trim();
-      const amountRaw = interaction.fields.getTextInputValue("amount").trim();
+      const details = interaction.fields.getTextInputValue("details").trim();
       const reward = interaction.fields.getTextInputValue("reward").trim();
       const note = interaction.fields.getTextInputValue("note").trim();
 
-      const amount = Number(amountRaw);
-
-      if (!title || !Number.isInteger(amount) || amount <= 0) {
+      if (!title || !details) {
         await interaction.reply({
-          content: "Bitte gib einen gueltigen Titel und eine ganze Menge groesser als 0 an.",
+          content: "Bitte fuelle Gesuch und Bedarf aus.",
           flags: 64,
         });
         return;
@@ -518,8 +559,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const payload = {
         type: isGuildQuest ? "GUILD" : "NORMAL",
         status: "OPEN",
+        category,
         title,
-        amount,
+        details,
         reward: reward || null,
         note: note || null,
         created_by_id: interaction.user.id,
@@ -554,26 +596,58 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.isStringSelectMenu()) {
-      if (interaction.customId === "select_quest_type") {
-        const selectedType = interaction.values[0];
+      if (interaction.customId === "select_quest_creation_type") {
+        const questType = interaction.values[0];
 
-        if (selectedType === "private") {
-          await interaction.showModal(buildQuestModal("NORMAL"));
+        const categorySelect = new StringSelectMenuBuilder()
+          .setCustomId(`select_quest_category_${questType}`)
+          .setPlaceholder("Waehle die Kategorie")
+          .addOptions([
+            {
+              label: "Waren",
+              value: "waren",
+              description: "Items, Mats, Flasks, Food, Crafting",
+            },
+            {
+              label: "Gruppe",
+              value: "gruppe",
+              description: "Ini, Raid, Twinks, Dungeonhilfe",
+            },
+            {
+              label: "Sonstiges",
+              value: "sonstiges",
+              description: "Alles, was sonst gebraucht wird",
+            },
+          ]);
+
+        const row = new ActionRowBuilder().addComponents(categorySelect);
+
+        await interaction.update({
+          content: "Waehle nun die Kategorie des Gesuchs.",
+          components: [row],
+        });
+        return;
+      }
+
+      if (
+        interaction.customId === "select_quest_category_private" ||
+        interaction.customId === "select_quest_category_guild"
+      ) {
+        const category = interaction.values[0];
+        const isGuildQuest = interaction.customId.endsWith("_guild");
+
+        if (isGuildQuest && !isLeitung(interaction.member)) {
+          await interaction.update({
+            content: "Nur die Leitung darf Gildengesuche aushaengen.",
+            components: [],
+          });
           return;
         }
 
-        if (selectedType === "guild") {
-          if (!isLeitung(interaction.member)) {
-            await interaction.update({
-              content: "Nur die Leitung darf Gildengesuche aushaengen.",
-              components: [],
-            });
-            return;
-          }
-
-          await interaction.showModal(buildQuestModal("GUILD"));
-          return;
-        }
+        await interaction.showModal(
+          buildQuestModal(isGuildQuest ? "GUILD" : "NORMAL", category === "waren" ? "Waren" : category === "gruppe" ? "Gruppe" : "Sonstiges")
+        );
+        return;
       }
 
       if (interaction.customId === "select_accept_quest") {
