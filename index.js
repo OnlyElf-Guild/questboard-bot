@@ -1,5 +1,6 @@
 require("dotenv").config();
 const http = require("http");
+const OpenAI = require("openai");
 const {
   Client,
   GatewayIntentBits,
@@ -32,7 +33,23 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.4";
 let questMessageId = null;
+
+const RANK_THRESHOLDS = [
+  { rank: "F", minXp: 0 },
+  { rank: "E", minXp: 100 },
+  { rank: "D", minXp: 250 },
+  { rank: "C", minXp: 500 },
+  { rank: "B", minXp: 900 },
+  { rank: "A", minXp: 1400 },
+  { rank: "S", minXp: 2200 },
+  { rank: "SSS", minXp: 3500 },
+];
 
 client.once(Events.ClientReady, async () => {
   try {
@@ -42,6 +59,110 @@ client.once(Events.ClientReady, async () => {
     console.error("FEHLER IN initQuestBoard:", err);
   }
 });
+
+function getRankFromXp(xp) {
+  let current = "F";
+  for (const entry of RANK_THRESHOLDS) {
+    if (xp >= entry.minXp) current = entry.rank;
+  }
+  return current;
+}
+
+function getLevelFromXp(xp) {
+  return Math.floor(xp / 100) + 1;
+}
+
+function truncateLabel(text, maxLen) {
+  const value = String(text || "");
+  if (value.length <= maxLen) return value;
+  return value.slice(0, maxLen - 1) + "…";
+}
+
+function safeDisplayName(interaction) {
+  return interaction.member?.displayName || interaction.user?.username || "Unbekannt";
+}
+
+function isLeitung(member) {
+  return Boolean(member?.roles?.cache?.has(process.env.LEITUNG_ROLE_ID));
+}
+
+function buildQuestModal(type = "NORMAL", category = "Waren") {
+  const isGuildQuest = type === "GUILD";
+
+  const modal = new ModalBuilder()
+    .setCustomId(
+      isGuildQuest
+        ? `modal_create_guild_${category.toLowerCase()}`
+        : `modal_create_private_${category.toLowerCase()}`
+    )
+    .setTitle(isGuildQuest ? "Gildengesuch aushaengen" : "Privates Gesuch aushaengen");
+
+  const titleInput = new TextInputBuilder()
+    .setCustomId("title")
+    .setLabel("Gesuch")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMaxLength(100)
+    .setPlaceholder(
+      category === "Gruppe"
+        ? "z. B. Mogu Shan Heroisch"
+        : "z. B. Trank der Jadeschlange"
+    );
+
+  const detailsInput = new TextInputBuilder()
+    .setCustomId("details")
+    .setLabel("Bedarf")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMaxLength(100)
+    .setPlaceholder(
+      category === "Gruppe"
+        ? "z. B. 1 Tank und 2 DD"
+        : "z. B. 50x oder 1 Stack"
+    );
+
+  const rewardInput = new TextInputBuilder()
+    .setCustomId("reward")
+    .setLabel("Belohnung")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(100)
+    .setPlaceholder("z. B. 300 Gold oder Nachnahme");
+
+  const noteInput = new TextInputBuilder()
+    .setCustomId("note")
+    .setLabel("Notiz")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(false)
+    .setMaxLength(300)
+    .setPlaceholder("Optionaler Hinweis");
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(titleInput),
+    new ActionRowBuilder().addComponents(detailsInput),
+    new ActionRowBuilder().addComponents(rewardInput),
+    new ActionRowBuilder().addComponents(noteInput)
+  );
+
+  return modal;
+}
+
+function buildDeliverModal(claimId, questTitle) {
+  const modal = new ModalBuilder()
+    .setCustomId(`modal_deliver_claim_${claimId}`)
+    .setTitle("Quest abgeben");
+
+  const submissionInput = new TextInputBuilder()
+    .setCustomId("submission_note")
+    .setLabel("Was genau hast du erledigt?")
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMaxLength(1000)
+    .setPlaceholder(`Beschreibe kurz und konkret deine Leistung fuer: ${questTitle}`);
+
+  modal.addComponents(new ActionRowBuilder().addComponents(submissionInput));
+  return modal;
+}
 
 async function initQuestBoard() {
   const channel = await client.channels.fetch(process.env.QUEST_CHANNEL_ID);
@@ -74,10 +195,14 @@ async function initQuestBoard() {
 
   questMessageId = newMsg.id;
 
-  await supabase.from("bot_state").upsert({
+  const { error: upsertError } = await supabase.from("bot_state").upsert({
     key: "quest_board_message_id",
     value: questMessageId,
   });
+
+  if (upsertError) {
+    console.error("Fehler beim Speichern der quest_board_message_id:", upsertError);
+  }
 
   await renderBoard(newMsg);
 }
@@ -122,7 +247,8 @@ async function getUserActiveNonGroupClaim(userId) {
       guild_quests!inner (
         id,
         category,
-        title
+        title,
+        details
       )
     `)
     .eq("user_id", userId)
@@ -144,7 +270,8 @@ async function getUserActiveGroupClaim(userId) {
       guild_quests!inner (
         id,
         category,
-        title
+        title,
+        details
       )
     `)
     .eq("user_id", userId)
@@ -175,6 +302,42 @@ async function getUserClaimForQuest(userId, questId) {
   return data || null;
 }
 
+async function getOrCreateAdventurer(userId, userName) {
+  const { data: existing, error: fetchError } = await supabase
+    .from("guild_adventurers")
+    .select("*")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (fetchError) {
+    console.error("Fehler bei getOrCreateAdventurer:", fetchError);
+    throw fetchError;
+  }
+
+  if (existing) return existing;
+
+  const { data: created, error: insertError } = await supabase
+    .from("guild_adventurers")
+    .insert({
+      user_id: userId,
+      user_name: userName,
+      rank: "F",
+      xp: 0,
+      level: 1,
+      quests_completed: 0,
+      total_xp_earned: 0,
+    })
+    .select("*")
+    .single();
+
+  if (insertError) {
+    console.error("Fehler beim Erstellen des Adventurers:", insertError);
+    throw insertError;
+  }
+
+  return created;
+}
+
 async function refreshQuestStatusFromClaims(questId) {
   const { data: quest, error: questError } = await supabase
     .from("guild_quests")
@@ -183,6 +346,8 @@ async function refreshQuestStatusFromClaims(questId) {
     .single();
 
   if (questError || !quest) return;
+
+  if (quest.status === "DONE" || quest.status === "CANCELLED") return;
 
   const claims = await getActiveClaimsForQuest(questId);
 
@@ -201,104 +366,14 @@ async function refreshQuestStatusFromClaims(questId) {
     }
   }
 
-  await supabase
+  const { error: updateError } = await supabase
     .from("guild_quests")
     .update({ status })
     .eq("id", questId);
-}
 
-async function renderBoard(message) {
-  const { data: quests, error } = await supabase
-    .from("guild_quests")
-    .select("*")
-    .in("status", ["OPEN", "CLAIMED", "AWAITING_CONFIRMATION"])
-    .order("id", { ascending: true });
-
-  if (error) {
-    console.error("Fehler beim Laden der Gesuche:", error);
-    return;
+  if (updateError) {
+    console.error("Fehler beim Aktualisieren des Quest-Status:", updateError);
   }
-
-  const questsWithClaims = await Promise.all(
-    quests.map(async (q) => {
-      const claims = await getQuestClaims(q.id);
-      return { ...q, claims };
-    })
-  );
-
-  const open = questsWithClaims.filter((q) => q.status === "OPEN");
-  const claimed = questsWithClaims.filter((q) => q.status === "CLAIMED");
-  const confirm = questsWithClaims.filter((q) => q.status === "AWAITING_CONFIRMATION");
-
-  const embed = new EmbedBuilder()
-    .setTitle("📜 Schwarzes Brett der Gilde")
-    .setColor(0x9b6b2f)
-    .setDescription(buildBoardText(open, claimed, confirm))
-    .setFooter({ text: "Aushang der Gildenhalle" });
-
-  const buttons = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("create")
-      .setLabel("📜 Gesuch aushaengen")
-      .setStyle(ButtonStyle.Primary),
-
-    new ButtonBuilder()
-      .setCustomId("accept")
-      .setLabel("🗡 Auftrag annehmen")
-      .setStyle(ButtonStyle.Success),
-
-    new ButtonBuilder()
-      .setCustomId("deliver")
-      .setLabel("📦 Abgegeben")
-      .setStyle(ButtonStyle.Secondary),
-
-    new ButtonBuilder()
-      .setCustomId("complete")
-      .setLabel("✅ Auftrag erledigt")
-      .setStyle(ButtonStyle.Secondary)
-  );
-
-  await message.edit({
-    content: "",
-    embeds: [embed],
-    components: [buttons],
-  });
-}
-
-function buildBoardText(open, claimed, confirm) {
-  let text = "";
-
-  text += "╔════════ **Offene Gesuche** ════════╗\n";
-  if (!open.length) {
-    text += "_Zur Zeit haengt kein neues Gesuch aus._\n";
-  } else {
-    open.forEach((q) => {
-      text += formatQuestLine(q);
-    });
-  }
-  text += "╚════════════════════════════════════╝\n\n";
-
-  text += "╔════ **Ausgesandte Abenteurer** ════╗\n";
-  if (!claimed.length) {
-    text += "_Derzeit ist kein Abenteurer ausgesandt._\n";
-  } else {
-    claimed.forEach((q) => {
-      text += formatQuestLine(q, { traveler: true });
-    });
-  }
-  text += "╚════════════════════════════════════╝\n\n";
-
-  text += "╔════ **Warten auf Nachnahme** ══════╗\n";
-  if (!confirm.length) {
-    text += "_Zur Zeit wartet kein Gesuch auf Bestaetigung._\n";
-  } else {
-    confirm.forEach((q) => {
-      text += formatQuestLine(q, { confirmation: true });
-    });
-  }
-  text += "╚════════════════════════════════════╝";
-
-  return text;
 }
 
 function formatQuestLine(q, options = {}) {
@@ -367,85 +442,366 @@ function formatQuestLine(q, options = {}) {
   return text;
 }
 
-function buildQuestModal(type = "NORMAL", category = "Waren") {
-  const isGuildQuest = type === "GUILD";
+function buildBoardText(open, claimed, confirm) {
+  let text = "";
 
-  const modal = new ModalBuilder()
-    .setCustomId(
-      isGuildQuest
-        ? `modal_create_guild_${category.toLowerCase()}`
-        : `modal_create_private_${category.toLowerCase()}`
-    )
-    .setTitle(isGuildQuest ? "Gildengesuch aushaengen" : "Privates Gesuch aushaengen");
+  text += "╔════════ **Offene Gesuche** ════════╗\n";
+  if (!open.length) {
+    text += "_Zur Zeit haengt kein neues Gesuch aus._\n";
+  } else {
+    open.forEach((q) => {
+      text += formatQuestLine(q);
+    });
+  }
+  text += "╚════════════════════════════════════╝\n\n";
 
-  const titleInput = new TextInputBuilder()
-    .setCustomId("title")
-    .setLabel("Gesuch")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true)
-    .setMaxLength(100)
-    .setPlaceholder(
-      category === "Gruppe"
-        ? "z. B. Mogu Shan Heroisch"
-        : "z. B. Trank der Jadeschlange"
-    );
+  text += "╔════ **Ausgesandte Abenteurer** ════╗\n";
+  if (!claimed.length) {
+    text += "_Derzeit ist kein Abenteurer ausgesandt._\n";
+  } else {
+    claimed.forEach((q) => {
+      text += formatQuestLine(q, { traveler: true });
+    });
+  }
+  text += "╚════════════════════════════════════╝\n\n";
 
-  const detailsInput = new TextInputBuilder()
-    .setCustomId("details")
-    .setLabel("Bedarf")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true)
-    .setMaxLength(100)
-    .setPlaceholder(
-      category === "Gruppe"
-        ? "z. B. 1 Tank und 2 DD"
-        : "z. B. 50x oder 1 Stack"
-    );
+  text += "╔════ **Warten auf Nachnahme** ══════╗\n";
+  if (!confirm.length) {
+    text += "_Zur Zeit wartet kein Gesuch auf Bestaetigung._\n";
+  } else {
+    confirm.forEach((q) => {
+      text += formatQuestLine(q, { confirmation: true });
+    });
+  }
+  text += "╚════════════════════════════════════╝";
 
-  const rewardInput = new TextInputBuilder()
-    .setCustomId("reward")
-    .setLabel("Belohnung")
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setMaxLength(100)
-    .setPlaceholder("z. B. 300 Gold oder Nachnahme");
-
-  const noteInput = new TextInputBuilder()
-    .setCustomId("note")
-    .setLabel("Notiz")
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(false)
-    .setMaxLength(300)
-    .setPlaceholder("Optionaler Hinweis");
-
-  modal.addComponents(
-    new ActionRowBuilder().addComponents(titleInput),
-    new ActionRowBuilder().addComponents(detailsInput),
-    new ActionRowBuilder().addComponents(rewardInput),
-    new ActionRowBuilder().addComponents(noteInput)
-  );
-
-  return modal;
+  return text;
 }
 
-function isLeitung(member) {
-  return member.roles.cache.has(process.env.LEITUNG_ROLE_ID);
+async function renderBoard(message) {
+  const { data: quests, error } = await supabase
+    .from("guild_quests")
+    .select("*")
+    .in("status", ["OPEN", "CLAIMED", "AWAITING_CONFIRMATION"])
+    .order("id", { ascending: true });
+
+  if (error) {
+    console.error("Fehler beim Laden der Gesuche:", error);
+    return;
+  }
+
+  const questsWithClaims = await Promise.all(
+    (quests || []).map(async (q) => {
+      const claims = await getQuestClaims(q.id);
+      return { ...q, claims };
+    })
+  );
+
+  const open = questsWithClaims.filter((q) => q.status === "OPEN");
+  const claimed = questsWithClaims.filter((q) => q.status === "CLAIMED");
+  const confirm = questsWithClaims.filter((q) => q.status === "AWAITING_CONFIRMATION");
+
+  const embed = new EmbedBuilder()
+    .setTitle("📜 Schwarzes Brett der Gilde")
+    .setColor(0x9b6b2f)
+    .setDescription(buildBoardText(open, claimed, confirm))
+    .setFooter({ text: "Aushang der Gildenhalle" });
+
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("create")
+      .setLabel("📜 Gesuch aushaengen")
+      .setStyle(ButtonStyle.Primary),
+
+    new ButtonBuilder()
+      .setCustomId("accept")
+      .setLabel("🗡 Auftrag annehmen")
+      .setStyle(ButtonStyle.Success),
+
+    new ButtonBuilder()
+      .setCustomId("deliver")
+      .setLabel("📦 Abgegeben")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("complete")
+      .setLabel("✅ Auftrag erledigt")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("profile")
+      .setLabel("🏅 Mein Rang")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  await message.edit({
+    content: "",
+    embeds: [embed],
+    components: [row1, row2],
+  });
 }
 
 async function refreshBoard() {
+  if (!questMessageId) return;
   const channel = await client.channels.fetch(process.env.QUEST_CHANNEL_ID);
   const msg = await channel.messages.fetch(questMessageId);
   await renderBoard(msg);
 }
 
-function truncateLabel(text, maxLen) {
-  if (text.length <= maxLen) return text;
-  return text.slice(0, maxLen - 1) + "…";
+function evaluateQuestFallback(quest, claim) {
+  const xpMin = Number.isFinite(Number(quest.xp_min)) ? Number(quest.xp_min) : 10;
+  const xpMax = Number.isFinite(Number(quest.xp_max)) ? Number(quest.xp_max) : 60;
+
+  const text = String(claim.submission_note || "").trim();
+  const length = text.length;
+
+  let xp = xpMin;
+  let reason = "Solide Abgabe bestaetigt.";
+
+  if (length >= 300) {
+    xp = Math.round(xpMin + (xpMax - xpMin) * 0.9);
+    reason = "Ausfuehrliche und plausible Abgabe.";
+  } else if (length >= 180) {
+    xp = Math.round(xpMin + (xpMax - xpMin) * 0.7);
+    reason = "Gute und nachvollziehbare Abgabe.";
+  } else if (length >= 80) {
+    xp = Math.round(xpMin + (xpMax - xpMin) * 0.5);
+    reason = "Plausible Abgabe mit ausreichender Beschreibung.";
+  } else if (length >= 20) {
+    xp = Math.round(xpMin + (xpMax - xpMin) * 0.3);
+    reason = "Kurze, aber verwertbare Abgabe.";
+  } else {
+    xp = xpMin;
+    reason = "Sehr knappe Abgabe, daher nur geringe XP.";
+  }
+
+  return {
+    xp: Math.max(xpMin, Math.min(xpMax, xp)),
+    reason,
+    difficulty: "MEDIUM",
+    confidence: 0.35,
+    source: "SYSTEM",
+  };
+}
+
+async function evaluateQuestWithGPT({ quest, claim }) {
+  const xpMin = Number.isFinite(Number(quest.xp_min)) ? Number(quest.xp_min) : 10;
+  const xpMax = Number.isFinite(Number(quest.xp_max)) ? Number(quest.xp_max) : 60;
+
+  const prompt = `
+Du bewertest erledigte Discord-Gildenquests fuer ein RPG-inspiriertes Rangsystem.
+
+WICHTIGE REGELN:
+- Gib AUSSCHLIESSLICH gueltiges JSON zurueck.
+- Keine Markdown-Formatierung.
+- Die XP muessen zwischen ${xpMin} und ${xpMax} liegen.
+- Bewerte nur auf Basis der vorliegenden Informationen.
+- Kurze Begruendung, maximal 220 Zeichen.
+- Wenn die Abgabe sehr knapp, unklar oder wenig plausibel ist, gib eher niedrige XP.
+- Wenn die Abgabe konkret, plausibel und aufwendig wirkt, gib eher hohe XP.
+
+Quest:
+${JSON.stringify(
+  {
+    id: quest.id,
+    type: quest.type,
+    category: quest.category,
+    title: quest.title,
+    details: quest.details,
+    reward: quest.reward,
+    guild_created: quest.guild_created,
+    xp_min: xpMin,
+    xp_max: xpMax,
+  },
+  null,
+  2
+)}
+
+Abgabe:
+${JSON.stringify(
+  {
+    claim_id: claim.id,
+    user_id: claim.user_id,
+    user_name: claim.user_name,
+    submission_note: claim.submission_note || "",
+    claimed_at: claim.claimed_at,
+    submitted_at: claim.submitted_at,
+  },
+  null,
+  2
+)}
+
+Antwortformat:
+{
+  "xp": number,
+  "reason": string,
+  "difficulty": "LOW" | "MEDIUM" | "HIGH",
+  "confidence": number
+}
+`;
+
+  try {
+    const response = await openai.responses.create({
+      model: OPENAI_MODEL,
+      input: prompt,
+    });
+
+    const raw = String(response.output_text || "").trim();
+
+    if (!raw) {
+      throw new Error("Leere GPT-Antwort");
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (parseErr) {
+      console.error("GPT-JSON-Parse-Fehler:", parseErr, raw);
+      throw parseErr;
+    }
+
+    let xp = Number(parsed.xp);
+    if (!Number.isFinite(xp)) xp = xpMin;
+
+    xp = Math.round(xp);
+    xp = Math.max(xpMin, Math.min(xpMax, xp));
+
+    return {
+      xp,
+      reason: String(parsed.reason || "Questleistung bewertet.").slice(0, 220),
+      difficulty: ["LOW", "MEDIUM", "HIGH"].includes(parsed.difficulty)
+        ? parsed.difficulty
+        : "MEDIUM",
+      confidence: Number.isFinite(Number(parsed.confidence))
+        ? Number(parsed.confidence)
+        : 0.5,
+      source: "GPT",
+    };
+  } catch (err) {
+    console.error("GPT-Bewertung fehlgeschlagen, nutze Fallback:", err);
+    return evaluateQuestFallback(quest, claim);
+  }
+}
+
+async function awardXpToUser({
+  userId,
+  userName,
+  questId,
+  claimId,
+  xp,
+  reason,
+  source = "GPT",
+}) {
+  const adventurer = await getOrCreateAdventurer(userId, userName);
+
+  const oldXp = Number(adventurer.xp || 0);
+  const oldLevel = Number(adventurer.level || 1);
+  const oldRank = String(adventurer.rank || "F");
+
+  const newXp = oldXp + xp;
+  const newLevel = getLevelFromXp(newXp);
+  const newRank = getRankFromXp(newXp);
+
+  const { error: updateError } = await supabase
+    .from("guild_adventurers")
+    .update({
+      user_name: userName,
+      xp: newXp,
+      level: newLevel,
+      rank: newRank,
+      quests_completed: Number(adventurer.quests_completed || 0) + 1,
+      total_xp_earned: Number(adventurer.total_xp_earned || 0) + xp,
+    })
+    .eq("user_id", userId);
+
+  if (updateError) {
+    console.error("Fehler beim Aktualisieren des Adventurers:", updateError);
+    throw updateError;
+  }
+
+  const { error: logError } = await supabase.from("guild_xp_log").insert({
+    user_id: userId,
+    user_name: userName,
+    quest_id: questId,
+    claim_id: claimId,
+    xp,
+    old_rank: oldRank,
+    new_rank: newRank,
+    old_level: oldLevel,
+    new_level: newLevel,
+    old_xp: oldXp,
+    new_xp: newXp,
+    reason,
+    source,
+  });
+
+  if (logError) {
+    console.error("Fehler beim Schreiben des XP-Logs:", logError);
+    throw logError;
+  }
+
+  return {
+    oldXp,
+    newXp,
+    oldLevel,
+    newLevel,
+    oldRank,
+    newRank,
+    rankUp: oldRank !== newRank,
+    levelUp: oldLevel !== newLevel,
+  };
+}
+
+async function showProfile(interaction) {
+  const userName = safeDisplayName(interaction);
+  const adventurer = await getOrCreateAdventurer(interaction.user.id, userName);
+
+  const nextRank = RANK_THRESHOLDS.find((r) => r.minXp > adventurer.xp) || null;
+  const progressText = nextRank
+    ? `${adventurer.xp}/${nextRank.minXp} XP bis Rang ${nextRank.rank}`
+    : `${adventurer.xp} XP • Hoechstrang erreicht`;
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🏅 Abenteurerprofil von ${userName}`)
+    .setColor(0x9b6b2f)
+    .addFields(
+      { name: "Rang", value: String(adventurer.rank || "F"), inline: true },
+      { name: "Level", value: String(adventurer.level || 1), inline: true },
+      { name: "XP", value: String(adventurer.xp || 0), inline: true },
+      {
+        name: "Erledigte Quests",
+        value: String(adventurer.quests_completed || 0),
+        inline: true,
+      },
+      {
+        name: "Gesamt-XP",
+        value: String(adventurer.total_xp_earned || 0),
+        inline: true,
+      },
+      {
+        name: "Fortschritt",
+        value: progressText,
+        inline: false,
+      }
+    )
+    .setFooter({ text: "Moege dein Ruf in der Gilde wachsen." });
+
+  await interaction.reply({
+    embeds: [embed],
+    flags: 64,
+  });
 }
 
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isButton()) {
+      if (interaction.customId === "profile") {
+        await showProfile(interaction);
+        return;
+      }
+
       if (interaction.customId === "create") {
         const select = new StringSelectMenuBuilder()
           .setCustomId("select_quest_creation_type")
@@ -479,7 +835,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const { data: openQuests, error } = await supabase
           .from("guild_quests")
-          .select("id, title, category, details, guild_created, created_by_id, max_claims, status")
+          .select(
+            "id, title, category, details, guild_created, created_by_id, max_claims, status"
+          )
           .in("status", ["OPEN", "CLAIMED"])
           .order("id", { ascending: true })
           .limit(25);
@@ -494,7 +852,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         const enriched = await Promise.all(
-          openQuests.map(async (q) => {
+          (openQuests || []).map(async (q) => {
             const claims = await getActiveClaimsForQuest(q.id);
             return { ...q, claims };
           })
@@ -564,7 +922,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.customId === "deliver") {
         const activeNonGroup = await getUserActiveNonGroupClaim(interaction.user.id);
         const activeGroup = await getUserActiveGroupClaim(interaction.user.id);
-
         const candidates = [activeNonGroup, activeGroup].filter(Boolean);
 
         if (!candidates.length) {
@@ -577,32 +934,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         if (candidates.length === 1) {
           const claim = candidates[0];
-
-          const { error: updateError } = await supabase
-            .from("guild_quest_claims")
-            .update({
-              status: "AWAITING_CONFIRMATION",
-              submitted_at: new Date().toISOString(),
-            })
-            .eq("id", claim.id)
-            .eq("status", "CLAIMED");
-
-          if (updateError) {
-            console.error("Fehler beim Melden als abgegeben:", updateError);
-            await interaction.reply({
-              content: "Der Auftrag konnte nicht als abgegeben vermerkt werden.",
-              flags: 64,
-            });
-            return;
-          }
-
-          await refreshQuestStatusFromClaims(claim.quest_id);
-          await refreshBoard();
-
-          await interaction.reply({
-            content: `Dein Beitrag zu Gesuch #${claim.quest_id} wurde als abgegeben vermerkt.`,
-            flags: 64,
-          });
+          await interaction.showModal(
+            buildDeliverModal(
+              claim.id,
+              claim.guild_quests?.title || `Quest #${claim.quest_id}`
+            )
+          );
           return;
         }
 
@@ -643,7 +980,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const eligibleQuests = quests.filter((q) => {
+        const eligibleQuests = (quests || []).filter((q) => {
           if (q.guild_created) return isLeitung(interaction.member);
           return q.created_by_id === interaction.user.id;
         });
@@ -679,8 +1016,70 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.isModalSubmit()) {
-      const privateMatch = interaction.customId.match(/^modal_create_private_(waren|gruppe|sonstiges)$/);
-      const guildMatch = interaction.customId.match(/^modal_create_guild_(waren|gruppe|sonstiges)$/);
+      const privateMatch = interaction.customId.match(
+        /^modal_create_private_(waren|gruppe|sonstiges)$/
+      );
+      const guildMatch = interaction.customId.match(
+        /^modal_create_guild_(waren|gruppe|sonstiges)$/
+      );
+      const deliverMatch = interaction.customId.match(/^modal_deliver_claim_(\d+)$/);
+
+      if (deliverMatch) {
+        const claimId = Number(deliverMatch[1]);
+        const submissionNote = interaction.fields.getTextInputValue("submission_note").trim();
+
+        if (!submissionNote || submissionNote.length < 10) {
+          await interaction.reply({
+            content: "Bitte beschreibe deine erledigte Aufgabe etwas genauer.",
+            flags: 64,
+          });
+          return;
+        }
+
+        const { data: claim, error: claimError } = await supabase
+          .from("guild_quest_claims")
+          .select("*")
+          .eq("id", claimId)
+          .eq("user_id", interaction.user.id)
+          .eq("status", "CLAIMED")
+          .single();
+
+        if (claimError || !claim) {
+          await interaction.reply({
+            content: "Dieser Auftrag kann nicht mehr abgegeben werden.",
+            flags: 64,
+          });
+          return;
+        }
+
+        const { error: updateError } = await supabase
+          .from("guild_quest_claims")
+          .update({
+            status: "AWAITING_CONFIRMATION",
+            submission_note: submissionNote,
+            submitted_at: new Date().toISOString(),
+          })
+          .eq("id", claimId)
+          .eq("status", "CLAIMED");
+
+        if (updateError) {
+          console.error("Fehler beim Speichern der Abgabe:", updateError);
+          await interaction.reply({
+            content: "Die Abgabe konnte nicht gespeichert werden.",
+            flags: 64,
+          });
+          return;
+        }
+
+        await refreshQuestStatusFromClaims(claim.quest_id);
+        await refreshBoard();
+
+        await interaction.reply({
+          content: `Deine Abgabe fuer Gesuch #${claim.quest_id} wurde eingereicht und wartet auf Bestaetigung.`,
+          flags: 64,
+        });
+        return;
+      }
 
       if (!privateMatch && !guildMatch) {
         return;
@@ -725,8 +1124,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         reward: reward || null,
         note: note || null,
         max_claims: category === "Gruppe" ? 4 : 1,
+        xp_min: category === "Gruppe" ? 25 : 10,
+        xp_max: category === "Gruppe" ? 90 : 60,
         created_by_id: interaction.user.id,
-        created_by_name: interaction.member?.displayName || interaction.user.username,
+        created_by_name: safeDisplayName(interaction),
         guild_created: isGuildQuest,
       };
 
@@ -889,7 +1290,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .insert({
             quest_id: questId,
             user_id: interaction.user.id,
-            user_name: interaction.member?.displayName || interaction.user.username,
+            user_name: safeDisplayName(interaction),
             status: "CLAIMED",
             claimed_at: new Date().toISOString(),
           });
@@ -919,47 +1320,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.customId === "select_deliver_claim") {
         const claimId = Number(interaction.values[0]);
 
-        const { data: claim, error } = await supabase
+        const { data: claimWithQuest, error: claimFetchError } = await supabase
           .from("guild_quest_claims")
-          .select("*")
+          .select(`
+            *,
+            guild_quests!inner (
+              title
+            )
+          `)
           .eq("id", claimId)
           .eq("user_id", interaction.user.id)
           .eq("status", "CLAIMED")
           .single();
 
-        if (error || !claim) {
+        if (claimFetchError || !claimWithQuest) {
           await interaction.update({
-            content: "Dieser Auftrag kann nicht mehr als abgegeben markiert werden.",
+            content: "Dieser Auftrag kann nicht mehr abgegeben werden.",
             components: [],
           });
           return;
         }
 
-        const { error: updateError } = await supabase
-          .from("guild_quest_claims")
-          .update({
-            status: "AWAITING_CONFIRMATION",
-            submitted_at: new Date().toISOString(),
-          })
-          .eq("id", claimId)
-          .eq("status", "CLAIMED");
-
-        if (updateError) {
-          console.error("Fehler beim Abgeben des Claims:", updateError);
-          await interaction.update({
-            content: "Der Auftrag konnte nicht als abgegeben markiert werden.",
-            components: [],
-          });
-          return;
-        }
-
-        await refreshQuestStatusFromClaims(claim.quest_id);
-        await refreshBoard();
-
-        await interaction.update({
-          content: `Dein Beitrag zu Gesuch #${claim.quest_id} wurde als abgegeben vermerkt.`,
-          components: [],
-        });
+        await interaction.showModal(
+          buildDeliverModal(claimWithQuest.id, claimWithQuest.guild_quests.title)
+        );
         return;
       }
 
@@ -999,7 +1383,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .eq("quest_id", questId)
           .eq("status", "AWAITING_CONFIRMATION");
 
-        if (claimsError || !waitingClaims.length) {
+        if (claimsError || !waitingClaims?.length) {
           await interaction.update({
             content: "Zu diesem Gesuch gibt es derzeit nichts zu bestaetigen.",
             components: [],
@@ -1007,34 +1391,59 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
 
-        const { error: doneError } = await supabase
-          .from("guild_quest_claims")
-          .update({
-            status: "DONE",
-            confirmed_at: new Date().toISOString(),
-          })
-          .eq("quest_id", questId)
-          .eq("status", "AWAITING_CONFIRMATION");
+        const summaryLines = [];
 
-        if (doneError) {
-          console.error("Fehler beim Abschliessen des Gesuchs:", doneError);
-          await interaction.update({
-            content: "Das Gesuch konnte nicht abgeschlossen werden.",
-            components: [],
+        for (const claim of waitingClaims) {
+          const evaluation = await evaluateQuestWithGPT({ quest, claim });
+
+          const progress = await awardXpToUser({
+            userId: claim.user_id,
+            userName: claim.user_name,
+            questId: quest.id,
+            claimId: claim.id,
+            xp: evaluation.xp,
+            reason: evaluation.reason,
+            source: evaluation.source || "GPT",
           });
-          return;
+
+          const { error: claimDoneError } = await supabase
+            .from("guild_quest_claims")
+            .update({
+              status: "DONE",
+              confirmed_at: new Date().toISOString(),
+              xp_awarded: evaluation.xp,
+              xp_reason: evaluation.reason,
+              evaluated_by: evaluation.source || "GPT",
+              evaluated_at: new Date().toISOString(),
+            })
+            .eq("id", claim.id)
+            .eq("status", "AWAITING_CONFIRMATION");
+
+          if (claimDoneError) {
+            console.error("Fehler beim Finalisieren eines Claims:", claimDoneError);
+            throw claimDoneError;
+          }
+
+          let line = `• ${claim.user_name}: +${evaluation.xp} XP`;
+          if (progress.levelUp) line += ` | Level ${progress.oldLevel} → ${progress.newLevel}`;
+          if (progress.rankUp) line += ` | Rang ${progress.oldRank} → ${progress.newRank}`;
+          summaryLines.push(line);
         }
 
         const remainingActiveClaims = await getActiveClaimsForQuest(questId);
 
         if (remainingActiveClaims.length === 0) {
-          await supabase
+          const { error: questDoneError } = await supabase
             .from("guild_quests")
             .update({
               status: "DONE",
               confirmed_at: new Date().toISOString(),
             })
             .eq("id", questId);
+
+          if (questDoneError) {
+            console.error("Fehler beim Abschliessen des Gesuchs:", questDoneError);
+          }
         } else {
           await refreshQuestStatusFromClaims(questId);
         }
@@ -1043,9 +1452,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         await interaction.update({
           content:
-            quest.category === "Gruppe"
-              ? `Alle wartenden Rueckmeldungen fuer Gesuch #${questId} wurden bestaetigt.`
-              : `Gesuch #${questId} wurde als erledigt bestaetigt.`,
+            `Gesuch #${questId} wurde bestaetigt.\n\n` +
+            `Vergebene XP:\n${summaryLines.join("\n")}`,
           components: [],
         });
         return;
