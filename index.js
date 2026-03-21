@@ -25,7 +25,7 @@ process.on("unhandledRejection", (reason) => {
 });
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
 
 const supabase = createClient(
@@ -51,12 +51,24 @@ const RANK_THRESHOLDS = [
   { rank: "SSS", minXp: 3500 },
 ];
 
+const RANK_ROLE_MAP = {
+  F: process.env.RANK_ROLE_F,
+  E: process.env.RANK_ROLE_E,
+  D: process.env.RANK_ROLE_D,
+  C: process.env.RANK_ROLE_C,
+  B: process.env.RANK_ROLE_B,
+  A: process.env.RANK_ROLE_A,
+  S: process.env.RANK_ROLE_S,
+  SSS: process.env.RANK_ROLE_SSS,
+};
+
 client.once(Events.ClientReady, async () => {
   try {
     console.log(`✅ Bot online als ${client.user.tag}`);
     await initQuestBoard();
+    await syncAllAdventurerRoles();
   } catch (err) {
-    console.error("FEHLER IN initQuestBoard:", err);
+    console.error("FEHLER BEIM START:", err);
   }
 });
 
@@ -336,6 +348,71 @@ async function getOrCreateAdventurer(userId, userName) {
   }
 
   return created;
+}
+
+async function syncDiscordRankRole(userId, rank) {
+  try {
+    const guild = await client.guilds.fetch(process.env.GUILD_ID);
+    const member = await guild.members.fetch(userId).catch(() => null);
+
+    if (!member) {
+      console.log(`Mitglied ${userId} nicht im Server gefunden.`);
+      return { ok: false, reason: "MEMBER_NOT_FOUND" };
+    }
+
+    const targetRoleId = RANK_ROLE_MAP[rank];
+
+    if (!targetRoleId) {
+      console.log(`Keine Discord-Rolle fuer Rang ${rank} konfiguriert.`);
+      return { ok: false, reason: "ROLE_NOT_CONFIGURED" };
+    }
+
+    const allRankRoleIds = Object.values(RANK_ROLE_MAP).filter(Boolean);
+
+    const rolesToRemove = allRankRoleIds.filter(
+      (roleId) => roleId !== targetRoleId && member.roles.cache.has(roleId)
+    );
+
+    if (rolesToRemove.length) {
+      await member.roles.remove(rolesToRemove).catch((err) => {
+        console.error(`Fehler beim Entfernen alter Rangrollen bei ${userId}:`, err);
+        throw err;
+      });
+    }
+
+    if (!member.roles.cache.has(targetRoleId)) {
+      await member.roles.add(targetRoleId).catch((err) => {
+        console.error(`Fehler beim Setzen der Rangrolle ${rank} bei ${userId}:`, err);
+        throw err;
+      });
+    }
+
+    return { ok: true };
+  } catch (err) {
+    console.error("Fehler in syncDiscordRankRole:", err);
+    return { ok: false, reason: "SYNC_ERROR", error: err };
+  }
+}
+
+async function syncAllAdventurerRoles() {
+  try {
+    const { data: adventurers, error } = await supabase
+      .from("guild_adventurers")
+      .select("user_id, rank");
+
+    if (error) {
+      console.error("Fehler beim Laden der Adventurer fuer Rollensync:", error);
+      return;
+    }
+
+    for (const adv of adventurers || []) {
+      await syncDiscordRankRole(adv.user_id, adv.rank);
+    }
+
+    console.log("✅ Rangrollen-Sync beim Start abgeschlossen");
+  } catch (err) {
+    console.error("Fehler in syncAllAdventurerRoles:", err);
+  }
 }
 
 async function refreshQuestStatusFromClaims(questId) {
@@ -742,6 +819,8 @@ async function awardXpToUser({
     throw logError;
   }
 
+  const roleSyncResult = await syncDiscordRankRole(userId, newRank);
+
   return {
     oldXp,
     newXp,
@@ -751,6 +830,7 @@ async function awardXpToUser({
     newRank,
     rankUp: oldRank !== newRank,
     levelUp: oldLevel !== newLevel,
+    roleSyncOk: roleSyncResult?.ok || false,
   };
 }
 
@@ -763,11 +843,15 @@ async function showProfile(interaction) {
     ? `${adventurer.xp}/${nextRank.minXp} XP bis Rang ${nextRank.rank}`
     : `${adventurer.xp} XP • Hoechstrang erreicht`;
 
+  const rankRoleId = RANK_ROLE_MAP[adventurer.rank];
+  const discordRankText = rankRoleId ? `<@&${rankRoleId}>` : "Keiner Rolle zugewiesen";
+
   const embed = new EmbedBuilder()
     .setTitle(`🏅 Abenteurerprofil von ${userName}`)
     .setColor(0x9b6b2f)
     .addFields(
       { name: "Rang", value: String(adventurer.rank || "F"), inline: true },
+      { name: "Discord-Rolle", value: discordRankText, inline: true },
       { name: "Level", value: String(adventurer.level || 1), inline: true },
       { name: "XP", value: String(adventurer.xp || 0), inline: true },
       {
@@ -1425,8 +1509,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
 
           let line = `• ${claim.user_name}: +${evaluation.xp} XP`;
-          if (progress.levelUp) line += ` | Level ${progress.oldLevel} → ${progress.newLevel}`;
-          if (progress.rankUp) line += ` | Rang ${progress.oldRank} → ${progress.newRank}`;
+
+          if (progress.levelUp) {
+            line += ` | Level ${progress.oldLevel} → ${progress.newLevel}`;
+          }
+
+          if (progress.rankUp) {
+            line += ` | Rang ${progress.oldRank} → ${progress.newRank}`;
+          }
+
+          if (progress.roleSyncOk) {
+            line += ` | Discord-Rang aktualisiert`;
+          }
+
           summaryLines.push(line);
         }
 
