@@ -13,6 +13,7 @@ const {
   TextInputStyle,
   StringSelectMenuBuilder,
   Events,
+  PermissionFlagsBits,
 } = require("discord.js");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -67,6 +68,7 @@ client.once(Events.ClientReady, async () => {
     console.log(`✅ Bot online als ${client.user.tag}`);
     await initQuestBoard();
     await syncAllAdventurerRoles();
+    console.log("Bot gestartet, Rangrollen-Sync aktiv.");
   } catch (err) {
     console.error("FEHLER BEIM START:", err);
   }
@@ -352,8 +354,16 @@ async function getOrCreateAdventurer(userId, userName) {
 
 async function syncDiscordRankRole(userId, rank) {
   try {
-    const guild = await client.guilds.fetch(process.env.GUILD_ID);
-    const member = await guild.members.fetch(userId).catch(() => null);
+    const guild = client.guilds.cache.get(process.env.GUILD_ID);
+    if (!guild) {
+      console.log(`Guild ${process.env.GUILD_ID} nicht im Cache gefunden.`);
+      return { ok: false, reason: "GUILD_NOT_FOUND" };
+    }
+
+    const member = await guild.members.fetch(userId).catch((err) => {
+      console.error(`Mitglied ${userId} konnte nicht geladen werden:`, err);
+      return null;
+    });
 
     if (!member) {
       console.log(`Mitglied ${userId} nicht im Server gefunden.`);
@@ -367,6 +377,30 @@ async function syncDiscordRankRole(userId, rank) {
       return { ok: false, reason: "ROLE_NOT_CONFIGURED" };
     }
 
+    const targetRole = guild.roles.cache.get(targetRoleId);
+    if (!targetRole) {
+      console.log(`Rolle ${targetRoleId} fuer Rang ${rank} existiert nicht im Server.`);
+      return { ok: false, reason: "ROLE_NOT_FOUND" };
+    }
+
+    const botMember = guild.members.me || (await guild.members.fetchMe().catch(() => null));
+    if (!botMember) {
+      console.log("Bot-Mitglied konnte nicht geladen werden.");
+      return { ok: false, reason: "BOT_MEMBER_NOT_FOUND" };
+    }
+
+    if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) {
+      console.log("Bot hat keine Berechtigung: ManageRoles");
+      return { ok: false, reason: "MISSING_MANAGE_ROLES" };
+    }
+
+    if (targetRole.position >= botMember.roles.highest.position) {
+      console.log(
+        `Bot-Rolle ist zu niedrig. Bot-Hoechste Rolle: ${botMember.roles.highest.position}, Zielrolle: ${targetRole.position}`
+      );
+      return { ok: false, reason: "ROLE_HIERARCHY_TOO_LOW" };
+    }
+
     const allRankRoleIds = Object.values(RANK_ROLE_MAP).filter(Boolean);
 
     const rolesToRemove = allRankRoleIds.filter(
@@ -374,17 +408,15 @@ async function syncDiscordRankRole(userId, rank) {
     );
 
     if (rolesToRemove.length) {
-      await member.roles.remove(rolesToRemove).catch((err) => {
-        console.error(`Fehler beim Entfernen alter Rangrollen bei ${userId}:`, err);
-        throw err;
-      });
+      await member.roles.remove(rolesToRemove);
+      console.log(`Alte Rangrollen bei ${member.user.tag} entfernt: ${rolesToRemove.join(", ")}`);
     }
 
     if (!member.roles.cache.has(targetRoleId)) {
-      await member.roles.add(targetRoleId).catch((err) => {
-        console.error(`Fehler beim Setzen der Rangrolle ${rank} bei ${userId}:`, err);
-        throw err;
-      });
+      await member.roles.add(targetRoleId);
+      console.log(`Rangrolle ${rank} an ${member.user.tag} vergeben.`);
+    } else {
+      console.log(`${member.user.tag} hat Rangrolle ${rank} bereits.`);
     }
 
     return { ok: true };
@@ -406,7 +438,8 @@ async function syncAllAdventurerRoles() {
     }
 
     for (const adv of adventurers || []) {
-      await syncDiscordRankRole(adv.user_id, adv.rank);
+      const result = await syncDiscordRankRole(adv.user_id, adv.rank);
+      console.log(`Start-Rollensync fuer ${adv.user_id}:`, result);
     }
 
     console.log("✅ Rangrollen-Sync beim Start abgeschlossen");
@@ -820,6 +853,7 @@ async function awardXpToUser({
   }
 
   const roleSyncResult = await syncDiscordRankRole(userId, newRank);
+  console.log(`Rollensync fuer ${userName}:`, roleSyncResult);
 
   return {
     oldXp,
@@ -844,7 +878,9 @@ async function showProfile(interaction) {
     : `${adventurer.xp} XP • Hoechstrang erreicht`;
 
   const rankRoleId = RANK_ROLE_MAP[adventurer.rank];
-  const discordRankText = rankRoleId ? `<@&${rankRoleId}>` : "Keiner Rolle zugewiesen";
+  const discordRankText = rankRoleId
+    ? `Soll-Rolle: <@&${rankRoleId}>`
+    : "Keiner Rolle zugewiesen";
 
   const embed = new EmbedBuilder()
     .setTitle(`🏅 Abenteurerprofil von ${userName}`)
@@ -1432,6 +1468,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (interaction.customId === "select_complete_quest") {
+        await interaction.deferUpdate();
+
         const questId = Number(interaction.values[0]);
 
         const { data: quest, error } = await supabase
@@ -1442,7 +1480,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .single();
 
         if (error || !quest) {
-          await interaction.update({
+          await interaction.editReply({
             content: "Dieses Gesuch steht nicht mehr zur Bestaetigung bereit.",
             components: [],
           });
@@ -1454,7 +1492,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           : quest.created_by_id === interaction.user.id;
 
         if (!allowed) {
-          await interaction.update({
+          await interaction.editReply({
             content: "Du darfst dieses Gesuch nicht als erledigt bestaetigen.",
             components: [],
           });
@@ -1468,7 +1506,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .eq("status", "AWAITING_CONFIRMATION");
 
         if (claimsError || !waitingClaims?.length) {
-          await interaction.update({
+          await interaction.editReply({
             content: "Zu diesem Gesuch gibt es derzeit nichts zu bestaetigen.",
             components: [],
           });
@@ -1545,7 +1583,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         await refreshBoard();
 
-        await interaction.update({
+        await interaction.editReply({
           content:
             `Gesuch #${questId} wurde bestaetigt.\n\n` +
             `Vergebene XP:\n${summaryLines.join("\n")}`,
